@@ -1,0 +1,121 @@
+# .gitlab-ci.yml
+stages:
+  - test
+  - build
+  - publish
+  - load_test
+  - deploy
+
+# ----------------------------
+# Unit tests (fast, uses Go image)
+# ----------------------------
+unit_tests:
+  stage: test
+  image: golang:1.20
+  script:
+    - go version
+    - go test ./... -v
+  variables:
+    # используем sqlite для тестов
+    DB_DIALECT: "sqlite3"
+    DB_CONN: ":memory:"
+  artifacts:
+    when: always
+    expire_in: 1 hour
+    reports:
+      junit: tests-report.xml
+  tags: []
+
+# ----------------------------
+# Build (build image and push commit-tag image)
+# ----------------------------
+build_image:
+  stage: build
+  image: docker:24.0.1
+  services:
+    - name: docker:dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375/
+    DOCKER_TLS_CERTDIR: ""
+  needs: ["unit_tests"]
+  script:
+    - docker info
+    - echo "$CI_JOB_TOKEN" | docker login -u "$CI_REGISTRY_USER" --password-stdin $CI_REGISTRY
+    - docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA .
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  artifacts:
+    expire_in: 1 hour
+  only:
+    - branches
+
+# ----------------------------
+# Publish (tag latest when commit is in main branch)
+# ----------------------------
+publish_latest:
+  stage: publish
+  image: docker:24.0.1
+  services:
+    - docker:dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375/
+    DOCKER_TLS_CERTDIR: ""
+  needs: ["build_image"]
+  script:
+    - echo "$CI_JOB_TOKEN" | docker login -u "$CI_REGISTRY_USER" --password-stdin $CI_REGISTRY
+    - docker pull $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+    - docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA $CI_REGISTRY_IMAGE:latest
+    - docker push $CI_REGISTRY_IMAGE:latest
+  only:
+    - main
+
+# ----------------------------
+# Load test (k6) — manual job; run against target URL (e.g. deployed app)
+# ----------------------------
+k6_load_test:
+  stage: load_test
+  image: grafana/k6:latest
+  when: manual
+  allow_failure: true
+  variables:
+    # TARGET_URL можно задать при запуске job в UI, по умолчанию localhost
+    TARGET_URL: "http://localhost:8080"
+  script:
+    - echo "Running k6 test against $TARGET_URL"
+    # запускаем k6 с опцией BASE_URL из переменной TARGET_URL
+    - k6 run -e BASE_URL="$TARGET_URL" k6/mixed_test.js --summary-trend-stats="avg,p(95),p(99)" --out json=k6/results.json
+  artifacts:
+    paths:
+      - k6/results.json
+    expire_in: 2 days
+
+# ----------------------------
+# Deploy: SSH to remote server and run docker compose (manual / or on main)
+# ----------------------------
+deploy_to_server:
+  stage: deploy
+  image: alpine:3.18
+  when: manual
+  only:
+    - main
+  before_script:
+    - apk add --no-cache openssh-client bash
+    - mkdir -p ~/.ssh
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - ssh-keyscan -H "$REMOTE_HOST" >> ~/.ssh/known_hosts
+  script:
+    - echo "Deploying to $REMOTE_HOST"
+    - >
+      ssh -o StrictHostKeyChecking=yes $REMOTE_USER@$REMOTE_HOST "
+        set -e
+        cd $REMOTE_DIR
+        # pull latest image (uses GitLab registry auth via CI credentials on host or rely on public)
+        docker compose pull || true
+        docker compose up -d --build
+      "
+  environment:
+    name: production
+    url: http://$REMOTE_HOST:8080
+  variables:
+    GIT_STRATEGY: none
