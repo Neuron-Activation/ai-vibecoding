@@ -195,3 +195,5 @@ deploy:
 * Репозиторий: `https://github.com/Neuron-Activation/ai-vibecoding`
 * Документация K6: `https://k6.io/docs/`
 * Docker: `https://www.docker.com/`
+
+jnjm
